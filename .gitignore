@@ -11,4 +11,4 @@
 *.sublime-workspace
 *.zip
 *.log
-config.ymlx
+config.yml
