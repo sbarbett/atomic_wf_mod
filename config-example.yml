@@ -1,0 +1,36 @@
+# Enter your UltraDNS credentials here
+username: "your_username"
+password: "your_password"
+# The domain name goes here.
+domain1.com:
+  # The hostname within the domain. Each hostname will be treated
+  # as a separate batch request.
+  test1:
+    # By specifying redirect_to and forward_type, it's assumed you want
+    # to delete an existing rrset and replace it with a web forward.
+    redirect_to: "https://www.github.com"
+    forward_type: HTTP_301_REDIRECT
+  test2:
+    redirect_to: "https://www.example.com"
+    forward_type: HTTP_302_REDIRECT
+  # Use "@" if you want to modify the apex of the domain.
+  "@":
+    redirect_to: "https://www.test.com/"
+    forward_type: HTTP_302_REDIRECT
+domain2.com:
+  test1:
+    # By specifying rtype, rdata and ttl, it's assumed you're deleting
+    # an existing web forward and replacing it with an rrset.
+    rtype: A
+    rdata: 1.1.1.1
+    ttl: 300
+  test2:
+    # Both A record and CNAME are supported.
+    rtype: CNAME
+    rdata: test1.0328-fitn-date.com
+    ttl: 600
+  # Remember that the apex cannot be a CNAME, per RFC.
+  "@":
+    rtype: A
+    rdata: 1.0.0.1
+    ttl: 900
