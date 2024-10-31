@@ -12,3 +12,4 @@
 *.zip
 *.log
 config.yml
+*.old

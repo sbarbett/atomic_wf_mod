@@ -3,7 +3,10 @@
 import yaml
 import json
 import argparse
+from tqdm import tqdm
 from ultra_rest_client.connection import RestApiConnection
+from parser import parse_yaml
+from helper import check_for_a, check_for_cname, get_webforward_guid
 
 # Set up argument parser
 parser = argparse.ArgumentParser(
@@ -23,120 +26,143 @@ args = parser.parse_args()
 with open(args.yaml, "r") as file:
     config = yaml.safe_load(file)
 
+# Extract credentials
 username = config["username"]
 password = config["password"]
+
+# Parse the YAML to obtain a structured list of domains
+parsed_domains = parse_yaml(config, tqdm)
 
 # Initialize UltraDNS client
 client = RestApiConnection(host='api.ultradns.com')
 client.auth(username, password)
 
-# Iterate over domains and hosts
-for domain_name, hosts in config.items():
-    if domain_name in ["username", "password"]:
-        continue  # Skip credentials in config
+# Initialize list to store operation messages
+messages = []
 
-    for host_name, params in hosts.items():
-        # Determine the full host name
-        full_host_name = f"{domain_name}." if host_name == "@" else f"{host_name}.{domain_name}"
+# Main Logic
+for domain_data in tqdm(parsed_domains, desc="Processing domains"):
+    domain_name = domain_data["domain"]
 
-        # Check if transitioning to a web forward
-        if "redirect_to" in params and "forward_type" in params:
-            redirect_to = params["redirect_to"]
-            forward_type = params["forward_type"]
-            
-            # Check if an A record exists
-            existing_rrset = client.get(f"/v3/zones/{domain_name}/rrsets/A")
-            rrset_uri = None
-            
-            # Handle response type
-            if isinstance(existing_rrset, dict) and "rrSets" in existing_rrset:
-                for rrset in existing_rrset["rrSets"]:
-                    # Compare ownerName directly with full_host_name for non-apex
-                    if rrset["ownerName"].rstrip(".") == full_host_name.rstrip("."):
-                        rrset_uri = f"/v1/zones/{domain_name}/rrsets/A/{host_name if host_name != '@' else domain_name}"
-                        break
-            
-            # If no A record, check for CNAME
-            if not rrset_uri:
-                existing_rrset = client.get(f"/v3/zones/{domain_name}/rrsets/CNAME")
-                
-                if isinstance(existing_rrset, dict) and "rrSets" in existing_rrset:
-                    for rrset in existing_rrset["rrSets"]:
-                        if rrset["ownerName"].rstrip(".") == full_host_name.rstrip("."):
-                            rrset_uri = f"/v1/zones/{domain_name}/rrsets/CNAME/{host_name if host_name != '@' else domain_name}"
-                            break
-            
-            # Output error message if no A or CNAME record exists
-            if rrset_uri is None:
-                print(f"No CNAME or A record exists for {full_host_name}, skipping batch request.")
-                continue
-            
-            # Create batch request with DELETE and POST actions
-            batch_request = [
-                {"method": "DELETE", "uri": rrset_uri},
-                {
-                    "method": "POST",
-                    "uri": f"/v1/zones/{domain_name}/webforwards",
-                    "body": {
-                        "requestTo": full_host_name,
-                        "defaultRedirectTo": redirect_to,
-                        "defaultForwardType": forward_type
-                    }
-                }
-            ]
-            
-            # Send batch request
-            response = client.post("/batch", json.dumps(batch_request))
-            print(response)
+    # Process rrsets from YAML
+    for rrset in tqdm(domain_data["rrsets"], desc=f"Iterating through rrsets in {domain_name}", leave=False):
+        host = rrset["host"]
+        full_host_name = f"{domain_name}" if host is None else f"{host}.{domain_name}"
+        rdata = rrset["rdata"]
+        rtype = rrset["rtype"]
+        ttl = rrset["ttl"]
 
-        # Check if creating an rrset (deleting a web forward)
-        elif "rdata" in params and "rtype" in params and "ttl" in params:
-            rtype = params["rtype"]
-            rdata = params["rdata"]
-            ttl = params["ttl"]
-            
-            # Ensure rdata is a list
-            if not isinstance(rdata, list):
-                rdata = [rdata]
-            
-            # Check for an existing web forward
-            existing_forwards = client.get(f"/v3/zones/{domain_name}/webforwards")
-            if isinstance(existing_forwards, list) and existing_forwards[0].get("errorCode") == 70002:
-                print(f"No web forwards exist for {full_host_name}.")
-                continue
-            elif not isinstance(existing_forwards, dict) or "webForwards" not in existing_forwards:
-                print(f"Unexpected response structure for web forwards request: {existing_forwards}")
-                continue
-            
-            guid = None
-            for forward in existing_forwards["webForwards"]:
-                # Compare requestTo, accounting for potential missing trailing dot
-                if forward["requestTo"].rstrip(".") == full_host_name.rstrip("."):
-                    guid = forward["guid"]
-                    break
-            
-            # Output error message if no web forward exists
-            if guid is None:
-                print(f"No web forward exists for {host_name}.{domain_name}, skipping batch request.")
-                continue
-            
-            # Create batch request with DELETE and POST actions
+        # Step 1: Check if a web forward exists for this hostname
+        guid = get_webforward_guid(domain_name, full_host_name, client)
+        if guid:
+            # If a web forward exists, delete it and add the rrset
             batch_request = [
                 {"method": "DELETE", "uri": f"/v3/zones/{domain_name}/webforwards/{guid}"},
                 {
                     "method": "POST",
-                    "uri": f"/v1/zones/{domain_name}/rrsets/{rtype}/{host_name if host_name != '@' else domain_name}",
+                    "uri": f"/v1/zones/{domain_name}/rrsets/{rtype}/{host if host else domain_name}",
                     "body": {
                         "ttl": ttl,
-                        "rdata": rdata  # rdata is now ensured to be a list
+                        "rdata": [rdata] if not isinstance(rdata, list) else rdata
                     }
                 }
             ]
-            
-            # Send batch request
             response = client.post("/batch", json.dumps(batch_request))
-            print(response)
+            messages.append({
+                "hostname": full_host_name,
+                "message": f"Converted web forward to {rtype} record",
+                "response": response
+            })
+            continue  # Move to the next rrset
 
-        # Handle case where required parameters are missing
-        else:
-            print(f"Missing parameters for {host_name}.{domain_name}. Check config-example.yml for details.")
+        # Step 2: Check for an existing rrset of the desired type
+        if rtype == "A":
+            if check_for_a(domain_name, full_host_name, client):
+                messages.append({
+                    "hostname": full_host_name,
+                    "message": f"{full_host_name} is already of type A with the desired configuration. Skipping."
+                })
+                continue
+            elif check_for_cname(domain_name, full_host_name, client):
+                # Delete CNAME before adding A record
+                rrset_uri = f"/v1/zones/{domain_name}/rrsets/CNAME/{host if host else domain_name}"
+                batch_request = [{"method": "DELETE", "uri": rrset_uri}]
+        elif rtype == "CNAME":
+            if check_for_cname(domain_name, full_host_name, client):
+                messages.append({
+                    "hostname": full_host_name,
+                    "message": f"{full_host_name} is already of type CNAME with the desired configuration. Skipping."
+                })
+                continue
+            elif check_for_a(domain_name, full_host_name, client):
+                # Delete A record before adding CNAME
+                rrset_uri = f"/v1/zones/{domain_name}/rrsets/A/{host if host else domain_name}"
+                batch_request = [{"method": "DELETE", "uri": rrset_uri}]
+
+        # Add the new rrset (A or CNAME)
+        batch_request.append({
+            "method": "POST",
+            "uri": f"/v1/zones/{domain_name}/rrsets/{rtype}/{host if host else domain_name}",
+            "body": {
+                "ttl": ttl,
+                "rdata": [rdata] if not isinstance(rdata, list) else rdata
+            }
+        })
+
+        # Send the batch request for rrset creation
+        response = client.post("/batch", json.dumps(batch_request))
+        messages.append({
+            "hostname": full_host_name,
+            "message": f"Converted to {rtype} record",
+            "response": response
+        })
+
+    # Process web forwards from YAML
+    for web_forward in tqdm(domain_data["web_forwards"], desc=f"Iterating through web forwards in {domain_name}", leave=False):
+        host = web_forward["host"]
+        full_host_name = f"{domain_name}" if host is None else f"{host}.{domain_name}"
+        redirect_to = web_forward["redirect_to"]
+        forward_type = web_forward["forward_type"]
+
+        # Check if a web forward already exists
+        guid = get_webforward_guid(domain_name, full_host_name, client)
+        if guid:
+            messages.append({
+                "hostname": full_host_name,
+                "message": f"Web forward for {full_host_name} already exists with desired configuration. Skipping."
+            })
+            continue
+
+        # Step 2: Check and delete any existing rrset before creating the web forward
+        rrset_uri = None
+        if check_for_a(domain_name, full_host_name, client):
+            rrset_uri = f"/v1/zones/{domain_name}/rrsets/A/{host if host else domain_name}"
+        elif check_for_cname(domain_name, full_host_name, client):
+            rrset_uri = f"/v1/zones/{domain_name}/rrsets/CNAME/{host if host else domain_name}"
+
+        # Prepare batch request
+        batch_request = []
+        if rrset_uri:
+            batch_request.append({"method": "DELETE", "uri": rrset_uri})
+
+        # Add the new web forward
+        batch_request.append({
+            "method": "POST",
+            "uri": f"/v1/zones/{domain_name}/webforwards",
+            "body": {
+                "requestTo": full_host_name,
+                "defaultRedirectTo": redirect_to,
+                "defaultForwardType": forward_type
+            }
+        })
+
+        # Send the batch request for web forward creation
+        response = client.post("/batch", json.dumps(batch_request))
+        messages.append({
+            "hostname": full_host_name,
+            "message": f"Converted rrset to web forward",
+            "response": response
+        })
+
+# Final output of messages
+print(json.dumps(messages, indent=2))
