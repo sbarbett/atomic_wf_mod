@@ -9,6 +9,7 @@ This script supports:
 
 * Converting existing DNS records (A/CNAME) to web forwards.
 * Converting web forwards to DNS records (A/CNAME).
+* Converting A<->CNAME records.
 * Configuring actions for multiple domains and hosts through a single YAML file.
 
 ## Dependencies
@@ -23,6 +24,7 @@ The dependencies include:
 
 * `pyyaml`: For handling YAML configuration files.
 * `ultra_rest_client`: For interfacing with the UDNS API.
+* `tqdm`: Progress bars for nicer-looking output.
 
 ## YAML Config
 
